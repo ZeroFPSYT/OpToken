@@ -1,0 +1,11 @@
+{
+  "name": "optoken",
+  "owner": { "name": "ZeroFPSYT" },
+  "plugins": [
+    {
+      "name": "optoken",
+      "source": "./optoken",
+      "description": "Claude se autorregula: esfuerzo justo, plan antes de actuar y cuidado del límite de uso"
+    }
+  ]
+}

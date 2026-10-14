@@ -1,0 +1,10 @@
+{
+  "name": "optoken",
+  "version": "0.1.0",
+  "license": "MIT",
+  "description": "Claude se autorregula: esfuerzo justo, plan antes de actuar, cuidado del límite de uso, detector de prueba y error y rutina semanal",
+  "types": "./types/index.d.ts",
+  "author": {
+    "name": "ZeroFPSYT"
+  }
+}
