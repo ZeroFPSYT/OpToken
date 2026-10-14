@@ -19,6 +19,13 @@
 
 Answer `y` to add the marketplace and pick the user scope. Then type `OpToken` in any session to open the settings.
 
+**On the web (claude.ai/code):** the `/plugin` command is not available there. Add these two lines to your cloud environment's setup script (environment menu → Edit → Setup script) and open a new session:
+
+```
+claude plugin marketplace add ZeroFPSYT/OpToken
+claude plugin install optoken@optoken
+```
+
 Requires Claude Code with plugin hooks (2.1.296 or later): terminal, desktop app or claude.ai/code. It does not run in the regular Claude chat.
 
 ## How it works
