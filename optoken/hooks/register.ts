@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
-import type { Effort, Measure, Settings, Step } from '../types'
+import type { Effort, Measure, Plan, Settings, Step } from '../types'
 
 const P = 'optoken'
 const measure = atom({ plugin: 'optoken', key: 'measure' } as const, null)
@@ -11,6 +11,11 @@ const strikes = atom({ plugin: 'optoken', key: 'strikes' } as const, {})
 const pending = atom({ plugin: 'optoken', key: 'pending' } as const, [])
 const warned = atom({ plugin: 'optoken', key: 'warned' } as const, [])
 const solo = atom({ plugin: 'optoken', key: 'solo' } as const, false)
+const plan = atom({ plugin: 'optoken', key: 'plan' } as const, null)
+const highCalls = atom({ plugin: 'optoken', key: 'highCalls' } as const, 0)
+const failRun = atom({ plugin: 'optoken', key: 'failRun' } as const, 0)
+const worked = atom({ plugin: 'optoken', key: 'worked' } as const, false)
+const idle = atom({ plugin: 'optoken', key: 'idle' } as const, 0)
 
 const EFFORTS: Effort[] = ['low', 'medium', 'high', 'xhigh', 'max']
 const DEFAULT_EFFORT: Effort = 'low'
@@ -19,6 +24,16 @@ const WEEK_MS = 7 * 24 * 3600 * 1000
 const STRIKES = 3
 const EDIT_TOOLS = ['Edit', 'Write', 'NotebookEdit']
 const DEFAULT_SETTINGS: Settings = { resume: 'ask', weekly: false }
+const SIZES = ['S', 'M', 'L'] as const
+/** Llamadas en esfuerzo alto, con plan en curso, antes de preguntar si ya se puede bajar. */
+const HIGH_CALLS = 8
+/** Turnos seguidos sin cambios, trabajando solo, antes de sugerir pausar las rutinas. */
+const IDLE_TURNS = 3
+/** Tareas que se guardan en el registro (`/optoken`). */
+const LOG_MAX = 50
+const HIGH: Effort[] = ['high', 'xhigh', 'max']
+/** Commits: la otra forma de cambiar el proyecto (además de editar archivos). */
+const COMMIT = /\bgit\s+(-C\s+\S+\s+)?commit\b/
 const RESUMES = ['ask', 'always', 'never'] as const
 const DAYS = ['both', '2', '1'] as const
 
@@ -51,14 +66,16 @@ const DIRECTIVE = `# OpToken (budget self-regulation)
 Goal: the best result at the lowest cost. The \`effort\` tool (optoken plugin) sets your reasoning effort for the next requests and reports the usage limits. Effort starts at low and returns to low after every answer.
 
 1. Conversation and questions: stay at low.
-2. When you decide to actually solve, build or change something: first call \`effort\` with high, then plan. When a later turn continues approved work, set its effort again first.
-3. The plan states, in one short line to the user: size (S / M / L), estimated cost as % of the 5-hour window, the effort to execute it (the lowest that executes without errors), and what you will delegate and to which model. Then set that effort.
+2. Every task that changes something (each one, also the next one in the same turn): first call \`effort\` with high and think the cheapest way to the best result, then call \`plan\` with start: task, size (S / M / L), estimated cost as % of the 5-hour window, the effort to execute it (the lowest that executes without errors) and what you will delegate and to which model. \`plan\` sets that effort; tell the user the plan in one short line. Edits and commits are refused while no plan is open.
+3. When the task is done, call \`plan\` with done: it measures the real cost against your estimate. Close it before starting the next task.
 4. While working: if the rest is mechanical, lower the effort; if something turns hard, raise it. A change applies from the next request, so no work is lost.
 5. Limits, with the user present: before a big step compare its estimated cost with the margin left (\`effort\` with status). When the margin gets short, tell the user in one line; they decide whether to go on.
 6. Working alone: only after the user explicitly asks you to keep working without them (e.g. "keep going, I'm off to bed"). Then call \`optoken\` with solo_start (solo_stop when they are back) and follow what it answers. Pick work you can finish before 95% of the 5-hour window: large tasks with a wide margin, small ones with little; when nothing fits, pause. At 95% or on a pause: save the state (commit + push), schedule the continuation as the resume setting says and tell the user in one line.
 7. Delegation (this counts as the user's permission): spawn subagents without asking for broad searches, independent parallel work or a fresh-eyes review; never for small tasks, since a subagent starts cold. Haiku for broad or mechanical searches, Sonnet for simple code with a plan, Opus for planning and diagnosis. Subagents run at medium effort.
 8. When the plugin flags trial and error: switch to high, redo the diagnosis from scratch and explain the new approach before continuing.
-9. Read only what you need (search, read parts, never reread).`
+9. Read only what you need (search, read parts, never reread).
+10. Check before spending: confirm a hypothesis with the smallest test that can disprove it before a fix; run long suites (browser, end to end) once at the end, not after every small change.
+11. Working with another session: before taking a task, read what it has taken and announce yours; never both on the same task without agreeing who touches which files.`
 
 function percent(m: Measure | null, kind: string): number | undefined {
   return m?.limits.find(l => l.kind === kind)?.percentUsed
@@ -127,6 +144,20 @@ function resumeText(s: Settings): string {
   return `Resume setting: ask. Ask the user now, once, whether to resume after the limit (yes / no). If yes, at 95% or on a pause, save the state and ${how}; if no, save the state and stop.`
 }
 
+function planLine(p: Plan): string {
+  const real = p.real === undefined ? '' : ` → real ${p.real}%`
+  return `${p.size} · ${p.task} · estimado ${p.cost}%${real} · esfuerzo ${p.effort}${p.delegate ? ` · delega: ${p.delegate}` : ''}`
+}
+
+async function getLog($: { store: { get: (k: string) => Promise<unknown> } }): Promise<Plan[]> {
+  try {
+    const v = await $.store.get('log')
+    return Array.isArray(v) ? (v as Plan[]) : []
+  } catch {
+    return []
+  }
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.tool.register({
@@ -157,6 +188,24 @@ export const register: Register = on => {
       },
       isDeferred: false,
     })
+    await $.tool.register({
+      name: 'plan',
+      description:
+        'OpToken: start declares a task before changing anything (task, size, estimated cost as % of the 5-hour window, effort to execute it, delegation) and sets that effort; done closes it and reports the real cost against the estimate. Edits and commits are refused while no plan is open.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          action: { type: 'string', enum: ['start', 'done'] },
+          task: { type: 'string' },
+          size: { type: 'string', enum: [...SIZES] },
+          cost: { type: 'number', description: 'Estimated cost, % of the 5-hour window' },
+          effort: { type: 'string', enum: [...EFFORTS] },
+          delegate: { type: 'string', description: 'What goes to which model, or "nothing"' },
+        },
+        required: ['action'],
+      },
+      isDeferred: false,
+    })
     await $.command.register({ name: 'optoken', description: 'Muestra límites, ritmo, esfuerzo y últimos pasos de OpToken' })
     return next(e)
   })
@@ -179,6 +228,7 @@ export const register: Register = on => {
     // Edits to one file are counted per turn; a failing command keeps its count
     // across turns ("try again") until it succeeds.
     await update($, strikes, s => Object.fromEntries(Object.entries(s).filter(([k]) => k.includes('|cmd:'))))
+    await update($, worked, () => false)
     return next(e)
   })
 
@@ -199,6 +249,56 @@ export const register: Register = on => {
       if (chosen) await update($, wanted, () => chosen)
       const text = status(await read($, measure), await read($, wanted))
       return { result: chosen ? `Effort set to ${chosen}.\n${text}` : text, ...(notes.length ? { context: notes } : {}) }
+    }
+
+    if (e.tool === `mcp__${P}__plan`) {
+      const a = e as unknown as { action?: string; task?: string; size?: string; cost?: number; effort?: string; delegate?: string }
+      const open = await read($, plan)
+      const five = percent(await read($, measure), 'five_hour')
+      const now = await $.clock.now()
+      let text: string
+      if (a.action === 'start') {
+        const size = SIZES.find(x => x === a.size)
+        const effort = EFFORTS.find(x => x === a.effort)
+        if (open) text = `A plan is still open (${planLine(open)}). Close it with done first.`
+        else if (!a.task || !size || typeof a.cost !== 'number' || !effort)
+          text = 'start needs task, size (S/M/L), cost (% of the 5-hour window) and effort.'
+        else {
+          const p: Plan = { task: a.task, size, cost: a.cost, effort, delegate: a.delegate, fiveAtStart: five, startedAt: now }
+          await update($, plan, () => p)
+          await update($, wanted, () => effort)
+          await update($, highCalls, () => 0)
+          text = `Plan open: ${planLine(p)}. Effort set to ${effort}. Tell the user this line, then work.`
+        }
+      } else if (a.action === 'done') {
+        if (!open) text = 'No plan is open.'
+        else {
+          const real = five !== undefined && open.fiveAtStart !== undefined && five >= open.fiveAtStart ? five - open.fiveAtStart : undefined
+          const closed: Plan = { ...open, real, endedAt: now }
+          await update($, plan, () => null)
+          const log = [...(await getLog($)), closed].slice(-LOG_MAX)
+          await $.store.set('log', log)
+          const verdict =
+            real === undefined
+              ? 'real cost unknown (the 5-hour window reset meanwhile)'
+              : `real ${real}% against ${open.cost}% estimated${real > open.cost * 1.5 + 1 ? ': well over the estimate, estimate higher next time' : ''}`
+          text = `Plan closed: ${open.task}: ${verdict}. Tell the user in one line.`
+        }
+      } else text = open ? `Open plan: ${planLine(open)}` : 'No plan is open.'
+      return { result: text, ...(notes.length ? { context: notes } : {}) }
+    }
+
+    // Sin plan no se cambia nada: ni ediciones ni commits (los subagentes trabajan dentro del plan de quien los lanzó).
+    const changes = EDIT_TOOLS.includes(e.tool) || (e.tool === 'Bash' && COMMIT.test(e.command))
+    if (main && changes && !(await read($, plan)))
+      return {
+        deny: 'OpToken: no plan is open. Call effort with high, think the cheapest way, then call plan with start (task, size, estimated cost %, effort, delegation) and try again.',
+      }
+    if (main && (await read($, plan)) && HIGH.includes((await read($, wanted)) ?? DEFAULT_EFFORT)) {
+      let n = 0
+      await update($, highCalls, c => (n = c + 1))
+      if (n === HIGH_CALLS)
+        notes.push(`OpToken: ${n} steps at high effort in this plan. If the planning is done and the rest is mechanical, lower the effort now.`)
     }
 
     if (e.tool === `mcp__${P}__optoken`) {
@@ -226,6 +326,15 @@ export const register: Register = on => {
 
     const res = await next(e)
     if (res.deny !== undefined) return res
+    if (main && changes) await update($, worked, () => true)
+    if (e.tool === 'Bash') {
+      let run = 0
+      await update($, failRun, c => (run = res.isError === true ? c + 1 : 0))
+      if (run > 0 && run % STRIKES === 0)
+        notes.push(
+          `OpToken: ${run} commands failed in a row (different ones). If this is trial and error, stop: call effort with high, redo the diagnosis from scratch and explain the new approach before continuing.`,
+        )
+    }
 
     let key: string | undefined
     if (e.tool === 'Bash') {
@@ -320,6 +429,17 @@ export const register: Register = on => {
     } catch {}
     const used = (await read($, wanted)) ?? DEFAULT_EFFORT
     await update($, wanted, () => null)
+    // Trabajando solo, turnos seguidos sin cambios: despertares que gastan sin aportar.
+    if (await read($, solo)) {
+      let n = 0
+      const did = await read($, worked)
+      await update($, idle, c => (n = did ? 0 : c + 1))
+      if (n === IDLE_TURNS)
+        await update($, pending, p => [
+          ...p,
+          `OpToken: ${n} turns in a row without changes while working alone. If there is nothing to do without the user, pause your routines and watchers (scheduled tasks enabled=false) and tell the user in one line; they resume them.`,
+        ])
+    }
     return { ...res, text: `[optoken] ${line(m, used)}` }
   })
 
@@ -327,6 +447,17 @@ export const register: Register = on => {
     const rows = (await read($, steps)).map(
       x => `${x.agent} ${x.model} esfuerzo=${x.sent ?? '—'} caché=${x.read} escrito=${x.wrote} nuevo=${x.input}`,
     )
-    return { text: [status(await read($, measure), await read($, wanted)), 'Últimos pasos:', ...rows].join('\n') }
+    const open = await read($, plan)
+    const log = (await getLog($)).slice(-10).map(p => `  ${planLine(p)}`)
+    return {
+      text: [
+        status(await read($, measure), await read($, wanted)),
+        `Plan abierto: ${open ? planLine(open) : 'ninguno'}`,
+        'Últimas tareas (estimado → real):',
+        ...(log.length ? log : ['  (ninguna todavía)']),
+        'Últimos pasos:',
+        ...rows,
+      ].join('\n'),
+    }
   })
 }

@@ -87,3 +87,54 @@ test('typing OpToken opens the settings menu', async ($, on) => {
   const res = await $.prompt.submit({ text: 'OpToken' } as never)
   expect(JSON.stringify(res)).toContain('settings menu')
 })
+
+test('edits and commits are refused while no plan is open', async ($, on) => {
+  on('tool.call', () => ({ result: { stdout: 'ok', stderr: '', interrupted: false }, text: 'ok' }))
+  const edit = await $.tool.call({ tool: 'Edit', file_path: 'a.ts', old_string: 'a', new_string: 'b' } as never)
+  expect(edit.deny).toContain('no plan is open')
+  const commit = await $.tool.call({ tool: 'Bash', command: 'git -C repo commit -m x' })
+  expect(commit.deny).toContain('no plan is open')
+  const ls = await $.tool.call({ tool: 'Bash', command: 'ls' })
+  expect(ls.deny).toBeUndefined()
+})
+
+test('a plan opens, sets its effort, lets edits through and measures the real cost', async ($, on) => {
+  mock.store(on)
+  on('session.measure', ($, e) => ({ changed: e.changed }))
+  on('clock.now', () => ({ value: Date.parse('2026-10-13T20:00:00.000Z') }))
+  on('tool.call', () => ({ result: { stdout: 'ok', stderr: '', interrupted: false }, text: 'ok' }))
+  await $.session.measure(measure(10))
+  const start = await $.tool.call({ tool: 'mcp__optoken__plan', action: 'start', task: 'botón', size: 'S', cost: 2, effort: 'medium', delegate: 'nada' } as never)
+  expect(String(start.result)).toContain('Effort set to medium')
+  const edit = await $.tool.call({ tool: 'Edit', file_path: 'a.ts', old_string: 'a', new_string: 'b' } as never)
+  expect(edit.deny).toBeUndefined()
+  await $.session.measure(measure(16))
+  const done = await $.tool.call({ tool: 'mcp__optoken__plan', action: 'done' } as never)
+  expect(String(done.result)).toContain('real 6% against 2% estimated: well over')
+  const after = await $.tool.call({ tool: 'Edit', file_path: 'a.ts', old_string: 'a', new_string: 'b' } as never)
+  expect(after.deny).toContain('no plan is open')
+  const shown = await $.command.run({ command: 'optoken', args: '' } as never)
+  expect(shown.text).toContain('estimado 2% → real 6%')
+})
+
+test('different commands failing in a row are flagged too', async ($, on) => {
+  on('tool.call', () => ({ result: { stdout: '', stderr: 'boom', interrupted: false }, isError: true, text: 'boom' }))
+  await $.tool.call({ tool: 'Bash', command: 'npm test' })
+  await $.tool.call({ tool: 'Bash', command: 'npm run e2e' })
+  const third = await $.tool.call({ tool: 'Bash', command: 'node x.js' })
+  expect(third.context?.join(' ')).toContain('failed in a row')
+})
+
+test('working alone, turns without changes suggest pausing the routines', async ($, on) => {
+  mock.store(on)
+  on('turn.start', ($, e) => ({ turnId: e.turnId }))
+  on('turn.complete', () => ({ text: '' }))
+  on('prompt.submit', ($, e) => ({ text: e.text, context: e.context }) as never)
+  await $.tool.call({ tool: 'mcp__optoken__optoken', action: 'solo_start' } as never)
+  for (const id of ['a', 'b', 'c']) {
+    await $.turn.start({ turnId: id } as never)
+    await $.turn.complete({ turnId: id, reason: 'answer', answer: 'nada' } as never)
+  }
+  const res = await $.prompt.submit({ text: 'despertador' } as never)
+  expect(JSON.stringify(res)).toContain('pause your routines')
+})
